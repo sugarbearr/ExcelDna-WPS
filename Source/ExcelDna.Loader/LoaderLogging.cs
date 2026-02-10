@@ -45,12 +45,22 @@ namespace ExcelDna.Loader.Logging
                 //       Somehow the null-reference exception being thrown and caught interferes with the AppDomain_AssemblyResolve!?
                 //       The problem only happened when ExcelDna.Integration had to be resolved from resources (in which case the calls here would come from AssemblyResolve.
                 //       Under the debugger, the problem was inconsistent (sometimes the load worked fine), but outside the debugger it always failed.
-                Debug.Print(eventType.ToString() + " : " + string.Format(message, args));
+                string formattedMessage = args != null && args.Length > 0
+                    ? string.Format(CultureInfo.InvariantCulture, message, args)
+                    : message;
+                Debug.Print(eventType.ToString() + " : " +
+                            string.Format(CultureInfo.InvariantCulture, "{0:yyyy-MM-dd HH:mm:ss.fff} {1}", DateTime.Now, formattedMessage));
                 return;
             }
             try
             {
-                TraceLogger.IntegrationTraceSource.TraceEvent(eventType, _eventId, message, args);
+                if (args != null && args.Length > 0)
+                {
+                    message = string.Format(CultureInfo.InvariantCulture, message, args);
+                }
+                string timestampedMessage = string.Format(CultureInfo.InvariantCulture,
+                    "{0:yyyy-MM-dd HH:mm:ss.fff} {1}", DateTime.Now, message);
+                TraceLogger.IntegrationTraceSource.TraceEvent(eventType, _eventId, timestampedMessage);
             }
             catch (Exception e)
             {

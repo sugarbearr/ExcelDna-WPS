@@ -20,11 +20,11 @@ namespace ExcelDna.Integration.Rtd
 {
     // Internal RTD registration support. Takes care of:
     // - On-demand registration of RTD server (used via XlCall.RTD...)
-    // - Provides a wrapper for the RTD server to allow us to use either the internally defined IRtdServer types 
-    //   or the 'real' COM interop types. 
+    // - Provides a wrapper for the RTD server to allow us to use either the internally defined IRtdServer types
+    //   or the 'real' COM interop types.
     //   CONSIDER: This would not be needed for .NET 4.
 
-    // NOTE: We don't use this(?) for the ExcelObservableRtdServer 
+    // NOTE: We don't use this(?) for the ExcelObservableRtdServer
     //       - that case is directly registered with the ComServer, and in the registry via AsyncUtil.Register()
 
     internal static class RtdRegistration
@@ -85,7 +85,7 @@ namespace ExcelDna.Integration.Rtd
                 return TryCallRTD(out result, progId, null, topics);
             }
 
-            // TODO: Check that ExcelRtdServer with stable ProgId case also works right here - 
+            // TODO: Check that ExcelRtdServer with stable ProgId case also works right here -
             //       might need to add to loadedRtdServers somehow
 
             // Check if already loaded.
@@ -152,6 +152,11 @@ namespace ExcelDna.Integration.Rtd
                         singletonClassFactoryRegistration?.Dispose();
 
                         Logger.RtdServer.Error("The RTD server of type {0} required by add-in {1} could not be registered.\r\nThis may be due to restricted permissions on the user's HKCU\\Software\\Classes key.\r\nError message: {2}", rtdServerType.FullName, DnaLibrary.CurrentLibrary.Name, secex.Message);
+
+                        // 尝试标记RTD失败，启用降级模式
+                        try { RtdFallbackManager.MarkRtdFailed($"UnauthorizedAccessException during RTD registration: {secex.Message}"); }
+                        catch { /* 忽略RtdFallbackManager初始化失败 */ }
+
                         result = ExcelErrorUtil.ToComError(ExcelError.ExcelErrorValue);
                         // Return true to have the #VALUE stick, just as it was before the array-call refactoring
                         return true;
@@ -162,8 +167,21 @@ namespace ExcelDna.Integration.Rtd
                         progIdRegistration?.Dispose();
                         singletonClassFactoryRegistration?.Dispose();
 
+                        if (TryGetXlCallExceptionReturn(ex, out var xlReturn))
+                        {
+                            Logger.RtdServer.Warn("RTD registration failed with {0}. Falling back.", xlReturn);
+                            try { RtdFallbackManager.MarkRtdFailed($"XlCallException during RTD registration: {xlReturn}"); }
+                            catch { /* 忽略RtdFallbackManager初始化失败 */ }
+                            throw new XlCallException(xlReturn);
+                        }
+
                         Logger.RtdServer.Error("The RTD server of type {0} required by add-in {1} could not be registered.\r\nThis is an unexpected error.\r\nError message: {2}", rtdServerType.FullName, DnaLibrary.CurrentLibrary.Name, ex.Message);
                         Debug.Print("RtdRegistration.RTD exception: " + ex.ToString());
+
+                        // 尝试标记RTD失败，启用降级模式
+                        try { RtdFallbackManager.MarkRtdFailed($"Exception during RTD registration: {ex.Message}"); }
+                        catch { /* 忽略RtdFallbackManager初始化失败 */ }
+
                         result = ExcelErrorUtil.ToComError(ExcelError.ExcelErrorValue);
                         // Return true to have the #VALUE stick, just as it was before the array-call refactoring
                         return true;
@@ -190,10 +208,33 @@ namespace ExcelDna.Integration.Rtd
                     }
                 }
             }
+            catch (ExcelDna.Integration.XlCallException ex)
+            {
+                Logger.RtdServer.Warn("RTD call failed with {0}. Falling back.", ex.xlReturn);
+
+                // 尝试标记RTD失败，启用降级模式
+                try { RtdFallbackManager.MarkRtdFailed($"XlCallException during TryCallRTD: {ex.xlReturn}"); }
+                catch { /* 忽略RtdFallbackManager初始化失败 */ }
+
+                throw;
+            }
             catch (Exception ex)
             {
+                if (TryGetXlCallExceptionReturn(ex, out var xlReturn))
+                {
+                    Logger.RtdServer.Warn("RTD call failed with {0}. Falling back.", xlReturn);
+                    try { RtdFallbackManager.MarkRtdFailed($"XlCallException during TryCallRTD: {xlReturn}"); }
+                    catch { /* 忽略RtdFallbackManager初始化失败 */ }
+                    throw new XlCallException(xlReturn);
+                }
+
                 Logger.RtdServer.Error("The RTD server of type {0} required by add-in {1} could not be registered.\r\nThis is an unexpected error.\r\nError message: {2}", rtdServerType.FullName, DnaLibrary.CurrentLibrary.Name, ex.Message);
                 Debug.Print("RtdRegistration.RTD exception: " + ex.ToString());
+
+                // 尝试标记RTD失败，启用降级模式
+                try { RtdFallbackManager.MarkRtdFailed($"Exception during TryCallRTD: {ex.Message}"); }
+                catch { /* 忽略RtdFallbackManager初始化失败 */ }
+
                 result = ExcelErrorUtil.ToComError(ExcelError.ExcelErrorValue);
                 // Return true to have the #VALUE stick, just as it was before the array-call refactoring
                 return true;
@@ -207,6 +248,60 @@ namespace ExcelDna.Integration.Rtd
             }
 
             return tryCallRTDResult;
+        }
+
+        internal static bool TryGetRtdServerType(string progId, out Type rtdServerType)
+        {
+            return registeredRtdServerTypes.TryGetValue(progId, out rtdServerType);
+        }
+
+        private static bool TryGetXlCallExceptionReturn(Exception ex, out XlCall.XlReturn xlReturn)
+        {
+            xlReturn = XlCall.XlReturn.XlReturnFailed;
+            if (ex == null)
+                return false;
+
+            if (ex is XlCallException local)
+            {
+                xlReturn = local.xlReturn;
+                return true;
+            }
+
+            Type exType = ex.GetType();
+            if (!string.Equals(exType.FullName, typeof(XlCallException).FullName, StringComparison.Ordinal))
+                return false;
+
+            object value = null;
+            var field = exType.GetField("xlReturn");
+            if (field != null)
+                value = field.GetValue(ex);
+
+            if (value == null)
+            {
+                var prop = exType.GetProperty("xlReturn");
+                if (prop != null)
+                    value = prop.GetValue(ex, null);
+            }
+
+            if (value is XlCall.XlReturn ret)
+            {
+                xlReturn = ret;
+                return true;
+            }
+
+            if (value is int intValue)
+            {
+                xlReturn = (XlCall.XlReturn)intValue;
+                return true;
+            }
+
+            if (value is Enum)
+            {
+                xlReturn = (XlCall.XlReturn)Enum.ToObject(typeof(XlCall.XlReturn), value);
+                return true;
+            }
+
+            return true;
         }
 
         // Returns true if the Excel call succeeded.
@@ -245,11 +340,11 @@ namespace ExcelDna.Integration.Rtd
         }
     }
 
-    // This wrapper is not used with servers implemented from ExcelRtdServer 
+    // This wrapper is not used with servers implemented from ExcelRtdServer
     [ClassInterface(ClassInterfaceType.None)]
     internal class RtdServerWrapper : IRtdServer
     {
-        // 'ProgId' under which ExcelDna registered the server 
+        // 'ProgId' under which ExcelDna registered the server
         // - might be the class FullName or might be the ProgIdAttribute.
         readonly string _progId;
 

@@ -127,6 +127,7 @@ namespace ExcelDna.Loader
 
         static void RegisterXlMethods(List<XlMethodInfo> xlMethods)
         {
+            var registerStart = DateTime.UtcNow;
             Logger.Registration.Verbose("Registering {0} methods", xlMethods.Count);
 
             // Sort by name in reverse order before registering - this is inspired by the article http://www.benf.org/excel/regcost/
@@ -135,6 +136,9 @@ namespace ExcelDna.Loader
             xlMethods.ForEach(RegisterXlMethod);
             // Increment the registration version (safe to call a few times)
             registrationInfoVersion += 1.0;
+
+            var elapsedMs = (DateTime.UtcNow - registerStart).TotalMilliseconds;
+            Logger.Registration.Verbose("Registering {0} methods completed in {1} ms", xlMethods.Count, elapsedMs.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture));
         }
 
         static void RegisterXlMethod(XlMethodInfo mi)

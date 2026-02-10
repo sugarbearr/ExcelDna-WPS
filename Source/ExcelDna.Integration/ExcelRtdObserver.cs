@@ -26,6 +26,20 @@ namespace ExcelDna.Integration.Rtd
                 throw new InvalidOperationException("ExcelAsyncUtil has not been initialized. This is an unexpected error.");
             }
 
+            // 检查是否应该使用降级模式（RTD不可用时）
+            try
+            {
+                if (RtdFallbackManager.ShouldUseFallback)
+                {
+                    return RtdFallbackManager.ProcessObservableFallback(functionName, parameters, options, getObservable);
+                }
+            }
+            catch (Exception ex)
+            {
+                // 如果RtdFallbackManager访问失败，忽略并继续正常RTD流程
+                Debug.Print("RtdFallbackManager access failed: {0}", ex.Message);
+            }
+
             // CONSIDER: Why not same problems with all RTD servers?
             AsyncCallInfo callInfo = new AsyncCallInfo(functionName, parameters);
             AsyncObservableState state = null;
@@ -44,7 +58,7 @@ namespace ExcelDna.Integration.Rtd
             if (state != null)
             {
                 object value;
-                // The TryGetValue call here is a big deal - it eventually calls Excel's RTD function 
+                // The TryGetValue call here is a big deal - it eventually calls Excel's RTD function
                 // (or not, it the observable is complete).
                 // The return value of TryGetValue indicates the special array-call where RTD fails, which we ignore here.
                 bool unused = state.TryGetValue(out value);
@@ -53,7 +67,7 @@ namespace ExcelDna.Integration.Rtd
 
             // Not registered before - actually register as a new Observable
             IExcelObservable observable = getObservable();
-            return RegisterObservable(callInfo, options, observable);
+            return RegisterObservable(functionName, parameters, callInfo, options, observable);
         }
 
         // Make a one-shot 'Observable' from the func
@@ -76,7 +90,7 @@ namespace ExcelDna.Integration.Rtd
 
         // Register a new observable
         // Returns null if it failed (due to RTD array-caller first call)
-        static object RegisterObservable(AsyncCallInfo callInfo, ExcelObservableOptions options, IExcelObservable observable)
+        static object RegisterObservable(string functionName, object parameters, AsyncCallInfo callInfo, ExcelObservableOptions options, IExcelObservable observable)
         {
             AsyncObservableState state;
             Guid id;
@@ -103,20 +117,53 @@ namespace ExcelDna.Integration.Rtd
             }
 
             // Will spin up RTD server and topic if required, causing us to be called again...
-            object value;
-            if (!state.TryGetValue(out value))
+            try
             {
-                Debug.Print("AsyncObservableImpl.RegisterObservable (GetValue Error) - Remove Id: {0}", id);
-                // Problem case - array-caller with RTD call that failed.
-                // Clean up state and return null - we'll be called again later and everything will be better.
+                object value;
+                if (!state.TryGetValue(out value))
+                {
+                    Debug.Print("AsyncObservableImpl.RegisterObservable (GetValue Error) - Remove Id: {0}", id);
+                    // Problem case - array-caller with RTD call that failed.
+                    // Clean up state and return null - we'll be called again later and everything will be better.
+                    lock (_registrationLock)
+                    {
+                        _observableStates.TryRemove(id, out _);
+                        _asyncCallIds.TryRemove(callInfo, out _);
+                    }
+                    return null;
+                }
+                return value;
+            }
+            catch (XlCallException ex)
+            {
+                // RTD调用失败（如WPS兼容性问题）
+                // 清理状态
                 lock (_registrationLock)
                 {
                     _observableStates.TryRemove(id, out _);
                     _asyncCallIds.TryRemove(callInfo, out _);
                 }
-                return null;
+
+                // 尝试标记RTD失败并使用降级模式处理
+                try
+                {
+                    RtdFallbackManager.MarkRtdFailed($"XlCallException during RTD call: {ex.Message}");
+
+                    if (RtdFallbackManager.EnableFallback)
+                    {
+                        return RtdFallbackManager.ProcessObservableFallback(
+                            functionName, parameters, options, () => observable);
+                    }
+                }
+                catch (Exception fallbackEx)
+                {
+                    // 如果RtdFallbackManager访问失败，忽略并重新抛出原始异常
+                    Debug.Print("RtdFallbackManager access failed in catch block: {0}", fallbackEx.Message);
+                }
+
+                // 重新抛出异常
+                throw;
             }
-            return value;
         }
 
         // Safe to call with an invalid Id, but that's not expected.
@@ -124,7 +171,7 @@ namespace ExcelDna.Integration.Rtd
         {
             Debug.Print("AsyncObservableImpl.ConnectObserver - Id: {0}", id);
 
-            // It's an error if the id is not on the list - the ExcelObserverRtdServer should protect is from the onw known case 
+            // It's an error if the id is not on the list - the ExcelObserverRtdServer should protect is from the onw known case
             // - when RTD is called from sheet open
             AsyncObservableState state;
             if (_observableStates.TryGetValue(id, out state))
@@ -134,7 +181,7 @@ namespace ExcelDna.Integration.Rtd
             }
             else
             {
-                // Not expected - the ExcelObserverRtdServer should have protected us, 
+                // Not expected - the ExcelObserverRtdServer should have protected us,
                 // since the only invalid id call would be for sheet open with direct RTD refresh.
                 Debug.Fail("AsyncObservableImpl.ConnectObserver - Invalid Id: " + id);
             }
@@ -198,7 +245,7 @@ namespace ExcelDna.Integration.Rtd
     }
 
     // Pushes data to Excel via the RTD topic.
-    // Observes a single Observable. 
+    // Observes a single Observable.
     // Needs to coordinate the IsCompleted status with all the other Observers for the Caller, to ensure coordinated 'completion'.
     internal class ExcelRtdObserver : IExcelRtdObserver
     {
@@ -216,7 +263,7 @@ namespace ExcelDna.Integration.Rtd
         {
             _topicUpdater = new TopicUpdater(topic);
 
-            // Set our wrapper Value, but not the internal Topic value 
+            // Set our wrapper Value, but not the internal Topic value
             // (which must never be #N/A if we want re-open restart).
             _value = ExcelError.ExcelErrorNA;
         }
@@ -225,7 +272,7 @@ namespace ExcelDna.Integration.Rtd
         {
             _isCompleted = true;
 
-            // 2016-11-04: We have to ensure that the UpdateNotify call is still called if 
+            // 2016-11-04: We have to ensure that the UpdateNotify call is still called if
             //             OnCompleted happens during the ConnectData
             //             To ensure this we set the internal topic value
 
@@ -256,7 +303,7 @@ namespace ExcelDna.Integration.Rtd
             //             since that prevents restart when a book is re-opened. (See details in ExcelObserverRtdServer.ConnectData)
             //             So we now initialize the Topic with a new value.
 
-            // 2016-11-04: ExcelRtdServer.ConnectData was changed so that this call, 
+            // 2016-11-04: ExcelRtdServer.ConnectData was changed so that this call,
             //             if it happens during the ConnectData, will have no effect (saving an extra function call).
 
             // 2020-03-02: Now Excel's behaviour seems to have changed, and without an updated value the topic does not seem to update even if present in RefreshData
@@ -358,7 +405,7 @@ namespace ExcelDna.Integration.Rtd
         {
             public readonly Guid Id;
 
-            // NOTE: That the topic is initialized with the value TopicValueActive is 
+            // NOTE: That the topic is initialized with the value TopicValueActive is
             //       important to the ConnectData implementation below
             //       - there is some interaction between topic values and the return value from ConnectData.
             public ObserverRtdTopic(ExcelObserverRtdServer server, int topicId, Guid id, object valueActive)
@@ -405,7 +452,7 @@ namespace ExcelDna.Integration.Rtd
             // Now ConnectData needs to return some value, which will only be used by Excel internally (and saved in the book's RTD topic value).
             // Our wrapper function (ExcelAsyncUtil.Run or ExcelAsyncUtil.Observe) will return #N/A no matter what we return here.
             // However, it seems that Excel handles the special 'busy' error #N/A here (return ExcelErrorUtil.ToComError(ExcelError.ExcelErrorNA))
-            // in a special way (<tp t="e"><v>#N/A</v> in volatileDependencies.xml) - while other values seem to trigger a recalculate on file open, 
+            // in a special way (<tp t="e"><v>#N/A</v> in volatileDependencies.xml) - while other values seem to trigger a recalculate on file open,
             // when Excel attempts to restart the RTD server and fails (due to transient ProgId).
             // So for the ObserverRtdTopic we ensure the internal value is not an error,
             // (it is initialized to TopicValueActive)
@@ -465,8 +512,8 @@ namespace ExcelDna.Integration.Rtd
     // Checked for equality and stored in a Dictionary, so we have to be careful
     // to define value equality and a consistent HashCode.
 
-    // Used as Keys in a Dictionary - should be immutable. 
-    // We allow parameters to be null or primitives or ExcelReference objects, 
+    // Used as Keys in a Dictionary - should be immutable.
+    // We allow parameters to be null or primitives or ExcelReference objects,
     // or a 1D array or 2D array with primitives or arrays.
     internal struct AsyncCallInfo : IEquatable<AsyncCallInfo>
     {
@@ -503,7 +550,7 @@ namespace ExcelDna.Integration.Rtd
 
             // CONSIDER: All of this could be replaced by a check for (obj is ValueType || obj is ExcelReference)
             //           which would allow a more flexible set of parameters, at the risk of comparisons going wrong.
-            //           We can reconsider if this arises, or when we implement async automatically or custom marshaling 
+            //           We can reconsider if this arises, or when we implement async automatically or custom marshaling
             //           to other data types. For now this allows everything that can be passed as parameters from Excel-DNA.
 
             // We also support using an opaque byte[] hash as the parameters 'key'.
@@ -820,7 +867,7 @@ namespace ExcelDna.Integration.Rtd
 
                 // Refresh RTD call
                 // NOTE: First time this will result in a call to ConnectData, which will call Subscribe and set the _currentObserver
-                //       For the first array-group call, this returns null (due to xlUncalced error), 
+                //       For the first array-group call, this returns null (due to xlUncalced error),
                 //       but Excel will call us again... (I hope).
                 if (!RtdRegistration.TryRTD(out value, _observerRtdServerProgId, null, _topics))
                 {
@@ -892,7 +939,7 @@ namespace ExcelDna.Integration.Rtd
     }
 
     // This is not a very elegant IObservable implementation - should not be public.
-    // It basically represents a Subject 
+    // It basically represents a Subject
     internal class ThreadPoolDelegateObservable : IExcelObservable
     {
         readonly ExcelFunc _func;

@@ -1146,9 +1146,34 @@ namespace ExcelDna.Integration
         public static object RTD(string progId, string server, params string[] topics)
         {
             object value;
-            bool unused = Rtd.RtdRegistration.TryRTD(out value, progId, server, topics);
-            // Return value is not used for now...?
-            return value;
+            try
+            {
+                if (ExcelDnaUtil.IsET)
+                {
+                    if (Rtd.RtdInProcess.TryCreateObservable(progId, server, topics, out var observable))
+                    {
+                        try { Rtd.RtdFallbackManager.MarkRtdFailed("WPS RTD not supported; using in-process RTD."); }
+                        catch { /* ignore */ }
+                        ExcelDna.Logging.Logger.RtdServer.Info("RtdInProcess - Using in-process RTD for {0}", progId);
+                        return ExcelAsyncUtil.Observe("RTD:" + progId, topics, () => observable);
+                    }
+                }
+
+                bool unused = Rtd.RtdRegistration.TryRTD(out value, progId, server, topics);
+                // Return value is not used for now...?
+                return value;
+            }
+            catch (XlCallException)
+            {
+                if (Rtd.RtdInProcess.TryCreateObservable(progId, server, topics, out var observable))
+                {
+                    try { Rtd.RtdFallbackManager.MarkRtdFailed("RTD not supported; using in-process RTD."); }
+                    catch { /* ignore */ }
+                    ExcelDna.Logging.Logger.RtdServer.Info("RtdInProcess - Using in-process RTD for {0}", progId);
+                    return ExcelAsyncUtil.Observe("RTD:" + progId, topics, () => observable);
+                }
+                throw;
+            }
         }
 
         // Support for suspending calls to the C API

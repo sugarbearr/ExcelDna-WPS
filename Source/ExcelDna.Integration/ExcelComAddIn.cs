@@ -3,9 +3,12 @@
 
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Globalization;
+using System.IO;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Threading;
 using ExcelDna.ComInterop.ComRegistration;
 using ExcelDna.Integration.CustomUI;
 using ExcelDna.Integration.Extensibility;
@@ -111,6 +114,10 @@ namespace ExcelDna.Integration
     {
         // Com Add-ins loaded for Ribbons.
         static List<object> loadedComAddIns = new List<object>();
+        static readonly object _wpsRetryLock = new object();
+        static readonly Dictionary<string, int> _wpsRetryCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        const int WpsComAddInRetryMax = 5;
+        const int WpsComAddInRetryDelayMs = 1500;
 
         public static void OnUnloadComAddIn(ExcelComAddIn addIn, object addInInst)
         {
@@ -148,6 +155,25 @@ namespace ExcelDna.Integration
             }
             addIn.SetProgId(progId);
 
+            LoadComAddInInternal(addIn, clsId, progId);
+        }
+
+        public static void LoadComAddIn(ExcelComAddIn addIn, Guid clsId, string progId)
+        {
+            // If we are called without the addIn's DnaLibrary being set, default to the current library
+            if (addIn.DnaLibrary == null)
+                addIn.DnaLibrary = DnaLibrary.CurrentLibrary;
+
+            if (string.IsNullOrEmpty(progId))
+                throw new ArgumentException("progId must be specified.", nameof(progId));
+
+            addIn.SetProgId(progId);
+
+            LoadComAddInInternal(addIn, clsId, progId);
+        }
+
+        private static void LoadComAddInInternal(ExcelComAddIn addIn, Guid clsId, string progId)
+        {
             // Put together some nicer descriptions for the Add-ins dialog.
             string friendlyName;
             if (addIn.FriendlyName != null)
@@ -160,11 +186,31 @@ namespace ExcelDna.Integration
                 friendlyName = addIn.DnaLibrary.Name + " (COM Add-in Helper)";
             string description = addIn.Description ?? string.Format("Dynamically created COM Add-in to load custom UI for the Excel Add-in {0}, located at {1}.", addIn.DnaLibrary.Name, DnaLibrary.XllPath);
 
+            bool isWpsHost = IsWpsHost();
+            if (isWpsHost && IsWpsComAddInLoaded(progId))
+            {
+                Logger.ComAddIn.Verbose("WPS: COM Add-In already loaded. Skipping reload for {0}", progId);
+                return;
+            }
 
             Logger.ComAddIn.Verbose("Getting Application object");
-            object app = ExcelDnaUtil.Application;
+            object app = GetApplicationForComAddIn(isWpsHost);
+            if (app == null)
+            {
+                if (isWpsHost)
+                {
+                    Logger.ComAddIn.Info("Application object unavailable in WPS; scheduling COM Add-In retry.");
+                    ScheduleWpsComAddInRetry(addIn, clsId, progId);
+                }
+                else
+                {
+                    Logger.ComAddIn.Error("Application object unavailable; skipping Ribbon/COM Add-In load.");
+                }
+                return;
+            }
+
             Type appType = app.GetType();
-            Logger.ComAddIn.Verbose("Got Application object: " + app.GetType().ToString());
+            Logger.ComAddIn.Verbose("Got Application object: " + appType.ToString());
 
             CultureInfo ci = new CultureInfo(1033);
             object excelComAddIns;
@@ -190,27 +236,47 @@ namespace ExcelDna.Integration
                     {
                         excelComAddIns = appType.InvokeMember("COMAddIns", BindingFlags.GetProperty, null, app, null, ci);
 
-                        //                            Debug.Print("Got COMAddins object: " + excelComAddIns.GetType().ToString());
-                        appType.InvokeMember("Update", BindingFlags.InvokeMethod, null, excelComAddIns, null, ci);
-                        //                            Debug.Print("Updated COMAddins object with AddIn registered");
-                        comAddIn = excelComAddIns.GetType().InvokeMember("Item", BindingFlags.InvokeMethod, null, excelComAddIns, new object[] { progId }, ci);
-                        //                            Debug.Print("Got the COMAddin object: " + comAddIn.GetType().ToString());
+                        try
+                        {
+                            appType.InvokeMember("Update", BindingFlags.InvokeMethod, null, excelComAddIns, null, ci);
+                        }
+                        catch (Exception ex)
+                        {
+                            Logger.ComAddIn.Info("COMAddIns.Update failed - continuing. {0}", ex);
+                        }
 
-                        // At this point Excel knows how to load our add-in by CLSID, so we could clean up the 
+                        try
+                        {
+                            comAddIn = excelComAddIns.GetType().InvokeMember("Item", BindingFlags.InvokeMethod, null, excelComAddIns, new object[] { progId }, ci);
+                        }
+                        catch (Exception ex)
+                        {
+                            Logger.ComAddIn.Info("COMAddIns.Item failed for {0}. {1}", progId, ex);
+                            if (!isWpsHost)
+                                throw;
+
+                            comAddIn = TryAddComAddIn(excelComAddIns, progId, ci);
+                        }
+
+                        // At this point Excel knows how to load our add-in by CLSID, so we could clean up the
                         // registry aggressively, before the actual (dangerous?) loading starts.
-                        // But this seems to lead to some distress - Excel has some assertion checked when 
+                        // But this seems to lead to some distress - Excel has some assertion checked when
                         // it updates the LoadBehavior after a successful load....
 
                         object connectState = comAddIn.GetType().InvokeMember("Connect", BindingFlags.GetProperty, null, comAddIn, null, ci);
-                        comAddIn.GetType().InvokeMember("Connect", BindingFlags.SetProperty, null, comAddIn, new object[] { false }, ci);
+                        TrySetComAddInConnect(comAddIn, false, ci);
                     }
                     // Swap out the dummy add-in for the real one
                     using (new SingletonClassFactoryRegistration(addIn, clsId))
                     {
-                        comAddIn.GetType().InvokeMember("Connect", BindingFlags.SetProperty, null, comAddIn, new object[] { true }, ci);
+                        TrySetComAddInConnect(comAddIn, true, ci);
                     }
                     //                            Debug.Print("COMAddin is loaded.");
                     loadedComAddIns.Add(comAddIn);
+                    if (isWpsHost)
+                    {
+                        MarkWpsComAddInLoaded(progId);
+                    }
 
                     Logger.ComAddIn.Verbose("Completed Loading Ribbon/COM Add-In");
 
@@ -247,6 +313,164 @@ namespace ExcelDna.Integration
             }
         }
 
+        private static bool IsWpsHost()
+        {
+            try
+            {
+                var fileName = Process.GetCurrentProcess().MainModule?.FileName;
+                if (string.IsNullOrEmpty(fileName))
+                    return false;
+
+                var processName = Path.GetFileNameWithoutExtension(fileName);
+                return string.Equals(processName, "et", StringComparison.OrdinalIgnoreCase);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static object GetApplicationForComAddIn(bool isWpsHost)
+        {
+            object app = null;
+            try
+            {
+                if (!isWpsHost)
+                {
+                    app = ExcelDnaUtil.GetApplicationNotProtectedNoThrow();
+                    if (app != null)
+                    {
+                        return app;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.ComAddIn.Info("GetApplicationNotProtectedNoThrow failed. {0}", ex);
+            }
+
+            const int maxRetries = 10;
+            const int delayMs = 100;
+            for (int i = 0; i < maxRetries; i++)
+            {
+                Thread.Sleep(delayMs);
+                try
+                {
+                    if (isWpsHost)
+                    {
+                        bool isProtected;
+                        app = ExcelDnaUtil.GetApplicationNoWorkbook(true, out isProtected);
+                    }
+                    else
+                    {
+                        app = ExcelDnaUtil.GetApplicationNotProtectedNoThrow();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Logger.ComAddIn.Info("Retry GetApplicationNotProtectedNoThrow failed. Attempt {0}/{1}. {2}", i + 1, maxRetries, ex);
+                }
+
+                if (app != null)
+                {
+                    return app;
+                }
+            }
+
+            return null;
+        }
+
+        private static object TryAddComAddIn(object excelComAddIns, string progId, CultureInfo ci)
+        {
+            try
+            {
+                Logger.ComAddIn.Verbose("Attempting COMAddIns.Add({0}, false)", progId);
+                return excelComAddIns.GetType().InvokeMember("Add", BindingFlags.InvokeMethod, null, excelComAddIns, new object[] { progId, false }, ci);
+            }
+            catch (Exception ex)
+            {
+                Logger.ComAddIn.Info("COMAddIns.Add(progId, false) failed for {0} - trying Add(progId). {1}", progId, ex);
+                return excelComAddIns.GetType().InvokeMember("Add", BindingFlags.InvokeMethod, null, excelComAddIns, new object[] { progId }, ci);
+            }
+        }
+
+        private static void TrySetComAddInConnect(object comAddIn, bool value, CultureInfo ci)
+        {
+            try
+            {
+                comAddIn.GetType().InvokeMember("Connect", BindingFlags.SetProperty, null, comAddIn, new object[] { value }, ci);
+            }
+            catch (Exception ex)
+            {
+                Logger.ComAddIn.Info("Setting COMAddIn.Connect={0} failed. {1}", value, ex);
+                if (value)
+                    throw;
+            }
+        }
+
+        private static bool IsWpsComAddInLoaded(string progId)
+        {
+            lock (_wpsRetryLock)
+            {
+                int count;
+                return _wpsRetryCounts.TryGetValue(progId, out count) && count < 0;
+            }
+        }
+
+        private static void MarkWpsComAddInLoaded(string progId)
+        {
+            lock (_wpsRetryLock)
+            {
+                _wpsRetryCounts[progId] = -1;
+            }
+        }
+
+        private static void ScheduleWpsComAddInRetry(ExcelComAddIn addIn, Guid clsId, string progId)
+        {
+            int attempt;
+            lock (_wpsRetryLock)
+            {
+                int count;
+                if (_wpsRetryCounts.TryGetValue(progId, out count))
+                {
+                    if (count < 0)
+                        return;
+                    if (count >= WpsComAddInRetryMax)
+                    {
+                        Logger.ComAddIn.Info("WPS: reached max COM Add-In retry attempts for {0}", progId);
+                        return;
+                    }
+                    count++;
+                    _wpsRetryCounts[progId] = count;
+                    attempt = count;
+                }
+                else
+                {
+                    _wpsRetryCounts[progId] = 1;
+                    attempt = 1;
+                }
+            }
+
+            if (!SynchronizationManager.IsInstalled)
+            {
+                Logger.ComAddIn.Info("WPS: SynchronizationManager not installed; retry skipped for {0}", progId);
+                return;
+            }
+
+            Logger.ComAddIn.Info("WPS: scheduling COM Add-In retry {0}/{1} for {2}", attempt, WpsComAddInRetryMax, progId);
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                Thread.Sleep(WpsComAddInRetryDelayMs);
+                try
+                {
+                    ExcelAsyncUtil.QueueAsMacro(() => LoadComAddInInternal(addIn, clsId, progId));
+                }
+                catch (Exception ex)
+                {
+                    Logger.ComAddIn.Info("WPS: QueueAsMacro retry failed for {0}. {1}", progId, ex);
+                }
+            });
+        }
     }
 
 }

@@ -26,6 +26,162 @@
             <param name="topics">List or array of topics to update</param>
             <param name="values">List or array of values matching the topics</param>
         </member>
+        <member name="T:ExcelDna.Integration.Rtd.RtdFallbackManager">
+            <summary>
+            RTD降级配置和状态管理
+            当RTD功能不可用时（如低版本WPS），提供降级方案
+            </summary>
+        </member>
+        <member name="P:ExcelDna.Integration.Rtd.RtdFallbackManager.EnableFallback">
+            <summary>
+            是否启用RTD降级功能
+            默认为true，允许在RTD失败时自动降级
+            </summary>
+        </member>
+        <member name="P:ExcelDna.Integration.Rtd.RtdFallbackManager.ForceFallbackMode">
+            <summary>
+            是否强制使用降级模式（跳过RTD尝试）
+            用于已知不支持RTD的环境
+            </summary>
+        </member>
+        <member name="P:ExcelDna.Integration.Rtd.RtdFallbackManager.RtdRetryIntervalMs">
+            <summary>
+            RTD失败后的重试间隔（毫秒）
+            设为0表示永不重试RTD
+            </summary>
+        </member>
+        <member name="P:ExcelDna.Integration.Rtd.RtdFallbackManager.FallbackRefreshIntervalMs">
+            <summary>
+            降级模式下自动刷新的间隔（毫秒）
+            用于持续更新的Observable数据流
+            默认为0，表示不自动刷新（避免无限循环）
+            </summary>
+        </member>
+        <member name="P:ExcelDna.Integration.Rtd.RtdFallbackManager.CacheExpirationMs">
+            <summary>
+            缓存条目的过期时间（毫秒）
+            超过此时间未访问的缓存条目将被清理
+            设为0表示永不过期
+            </summary>
+        </member>
+        <member name="P:ExcelDna.Integration.Rtd.RtdFallbackManager.CacheCleanupIntervalMs">
+            <summary>
+            缓存清理间隔（毫秒）
+            </summary>
+        </member>
+        <member name="P:ExcelDna.Integration.Rtd.RtdFallbackManager.RtdFailed">
+            <summary>
+            RTD是否已经失败（用于快速跳过后续RTD尝试）
+            </summary>
+        </member>
+        <member name="M:ExcelDna.Integration.Rtd.RtdFallbackManager.MarkRtdFailed(System.String)">
+            <summary>
+            标记RTD已失败，后续调用将使用降级方案
+            </summary>
+        </member>
+        <member name="M:ExcelDna.Integration.Rtd.RtdFallbackManager.ResetRtdFailedState">
+            <summary>
+            重置RTD失败状态（用于测试或手动重试）
+            </summary>
+        </member>
+        <member name="P:ExcelDna.Integration.Rtd.RtdFallbackManager.ShouldUseFallback">
+            <summary>
+            检查是否应该使用降级模式
+            </summary>
+        </member>
+        <member name="M:ExcelDna.Integration.Rtd.RtdFallbackManager.TestRtdSupport">
+            <summary>
+            在加载时主动测试RTD支持
+            建议在AutoOpen中调用此方法
+            </summary>
+            <returns>true表示RTD可用，false表示需要使用降级模式</returns>
+        </member>
+        <member name="M:ExcelDna.Integration.Rtd.RtdFallbackManager.GetWpsVersion">
+            <summary>
+            获取WPS版本号
+            </summary>
+        </member>
+        <member name="M:ExcelDna.Integration.Rtd.RtdFallbackManager.TryTestRtdCall">
+            <summary>
+            尝试进行一次简单的RTD测试调用
+            </summary>
+        </member>
+        <member name="M:ExcelDna.Integration.Rtd.RtdFallbackManager.ConfigureForWpsIfNeeded">
+            <summary>
+            检测并配置WPS兼容模式
+            建议在AutoOpen中的SynchronizationManager安装后调用
+            </summary>
+        </member>
+        <member name="M:ExcelDna.Integration.Rtd.RtdFallbackManager.FallbackCacheEntry.IsExpired(System.Int32)">
+            <summary>
+            检查缓存条目是否过期
+            </summary>
+        </member>
+        <member name="M:ExcelDna.Integration.Rtd.RtdFallbackManager.FallbackCacheEntry.Touch">
+            <summary>
+            更新最后访问时间
+            </summary>
+        </member>
+        <member name="M:ExcelDna.Integration.Rtd.RtdFallbackManager.FallbackCacheEntry.AddCaller(ExcelDna.Integration.ExcelReference)">
+            <summary>
+            添加调用者单元格引用（去重）
+            </summary>
+        </member>
+        <member name="M:ExcelDna.Integration.Rtd.RtdFallbackManager.FallbackCacheEntry.GetCallers">
+            <summary>
+            获取所有调用者的副本
+            </summary>
+        </member>
+        <member name="M:ExcelDna.Integration.Rtd.RtdFallbackManager.ProcessObservableFallback(System.String,System.Object,ExcelDna.Integration.ExcelObservableOptions,ExcelDna.Integration.ExcelObservableSource)">
+            <summary>
+            使用降级模式处理Observable
+            </summary>
+        </member>
+        <member name="T:ExcelDna.Integration.Rtd.RtdFallbackManager.FallbackObserver">
+            <summary>
+            降级模式的Observer，将结果写入缓存
+            </summary>
+        </member>
+        <member name="M:ExcelDna.Integration.Rtd.RtdFallbackManager.RequestBatchRecalculation">
+            <summary>
+            请求批量重算（带节流）
+            </summary>
+        </member>
+        <member name="M:ExcelDna.Integration.Rtd.RtdFallbackManager.StartTimers">
+            <summary>
+            启动缓存清理定时器
+            </summary>
+        </member>
+        <member name="M:ExcelDna.Integration.Rtd.RtdFallbackManager.StopTimers">
+            <summary>
+            停止定时器
+            </summary>
+        </member>
+        <member name="M:ExcelDna.Integration.Rtd.RtdFallbackManager.CleanupExpiredCache(System.Object)">
+            <summary>
+            清理过期的缓存条目
+            </summary>
+        </member>
+        <member name="M:ExcelDna.Integration.Rtd.RtdFallbackManager.ClearCache(ExcelDna.Integration.Rtd.AsyncCallInfo)">
+            <summary>
+            清理指定条目的缓存
+            </summary>
+        </member>
+        <member name="M:ExcelDna.Integration.Rtd.RtdFallbackManager.ClearAllCache">
+            <summary>
+            清理所有缓存
+            </summary>
+        </member>
+        <member name="T:ExcelDna.Integration.Rtd.RtdFallbackManager.CacheStatistics">
+            <summary>
+            缓存统计信息
+            </summary>
+        </member>
+        <member name="M:ExcelDna.Integration.Rtd.RtdFallbackManager.GetCacheStatistics">
+            <summary>
+            获取当前缓存统计信息
+            </summary>
+        </member>
         <member name="T:ExcelDna.Integration.ExcelFunctionAttribute">
             <summary>
             For user-defined functions.
@@ -244,6 +400,12 @@
             <returns>All public static methods in registered assemblies that are decorated with an [ExcelFunction] attribute 
             (or a derived attribute, like [ExcelAsyncFunction]).
             </returns>
+        </member>
+        <member name="M:ExcelDna.Registration.ExcelRegistration.ProcessFunctions(System.Collections.Generic.IEnumerable{ExcelDna.Registration.ExcelFunctionRegistration})">
+            <summary>
+            Prepares the given functions for registration with Excel-DNA.
+            </summary>
+            <param name="registrationEntries"></param>
         </member>
         <member name="M:ExcelDna.Registration.ExcelRegistration.RegisterFunctions(System.Collections.Generic.IEnumerable{ExcelDna.Registration.ExcelFunctionRegistration})">
             <summary>

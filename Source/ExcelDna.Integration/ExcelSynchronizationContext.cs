@@ -189,6 +189,8 @@ namespace ExcelDna.Integration
         static extern bool KillTimer(HandleRef hwnd, int idEvent);
         int _timerId;   // Only gets values 0 or 1. Used both as the uIDEvent parameter for the Windows Timer, and as a flag to indicate whether there is an active timer.
         const int RETRY_INTERVAL_MS = 250;
+        static int _penHelperWpsUnsupportedLogged = 0;
+        static int _penHelperUnsupported = 0;
         #endregion
 
         SynchronizationWindow _syncWindow;
@@ -244,7 +246,16 @@ namespace ExcelDna.Integration
         {
             try
             {
-                bool runOK = COMRunMacro(_syncMacroName);
+                bool runOK;
+                bool useDirect = ExcelDnaUtil.IsET || Volatile.Read(ref _penHelperUnsupported) == 1;
+                if (useDirect)
+                {
+                    runOK = TryRunSyncMacroDirect();
+                }
+                else
+                {
+                    runOK = COMRunMacro(_syncMacroName);
+                }
                 if (!runOK && _timerId == 0)
                 {
                     // Timer is not yet set - so set a new timer
@@ -267,6 +278,25 @@ namespace ExcelDna.Integration
             {
                 // Includes unexpected TargetInvocationExceptions which are not known COMExceptions
                 Logger.Runtime.Error(ex, "Unexpected error trying to run SyncMacro for queued macro execution.");
+            }
+        }
+
+        bool TryRunSyncMacroDirect()
+        {
+            try
+            {
+                if (IsInFormulaEditMode())
+                    return false;
+
+                // WPS does not reliably support Application.Run macro context.
+                // We're already on the main thread, so invoke the queued work directly.
+                SyncMacro(0);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Logger.Runtime.Warn("Direct SyncMacro execution failed in WPS. Error: {0}", ex.Message);
+                return false;
             }
         }
 
@@ -516,6 +546,16 @@ namespace ExcelDna.Integration
             {
                 // Succeeded
                 return fmlaInfo.wPointMode != XlCall.xlModeReady;
+            }
+            else if (result == 32)
+            {
+                // Some hosts (e.g. WPS) return 32 when PenHelper is not supported - treat as "not in edit mode"
+                Interlocked.Exchange(ref _penHelperUnsupported, 1);
+                if (Interlocked.Exchange(ref _penHelperWpsUnsupportedLogged, 1) == 0)
+                {
+                    Logger.Registration.Info("IsInFormulaEditMode - PenHelper not supported (result 32). Proceeding without edit-mode check.");
+                }
+                return false;
             }
             else
             {

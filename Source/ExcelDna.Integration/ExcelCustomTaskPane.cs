@@ -18,6 +18,15 @@ namespace ExcelDna.Integration.CustomUI
         // So we use WeakReferences to not interfere with lifetime, but have a chance to clean up for live ones.
         private static readonly List<WeakReference> _customTaskPanes = new List<WeakReference>();
 
+        public static void InitCTPFactory(Guid clsId, string progId)
+        {
+            if (_addin != null)
+                return;
+
+            _addin = new ExcelCustomTaskPaneAddIn { DnaLibrary = DnaLibrary.CurrentLibrary };
+            ExcelComAddInHelper.LoadComAddIn(_addin, clsId, progId);
+        }
+
         public static CustomTaskPane CreateCustomTaskPane(Type userControlType, string title) 
         {
             return CreateCustomTaskPane(userControlType, title, Type.Missing);

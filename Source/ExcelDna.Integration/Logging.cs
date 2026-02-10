@@ -234,7 +234,13 @@ namespace ExcelDna.Logging
         {
             try
             {
-                TraceLogger.IntegrationTraceSource.TraceEvent(eventType, _eventId, message, args);
+                if (args != null && args.Length > 0)
+                {
+                    message = string.Format(CultureInfo.InvariantCulture, message, args);
+                }
+                string timestampedMessage = string.Format(CultureInfo.InvariantCulture,
+                    "{0:yyyy-MM-dd HH:mm:ss.fff} {1}", DateTime.Now, message);
+                TraceLogger.IntegrationTraceSource.TraceEvent(eventType, _eventId, timestampedMessage);
             }
             catch (Exception e)
             {

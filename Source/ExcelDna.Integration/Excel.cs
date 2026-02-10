@@ -38,6 +38,12 @@ namespace ExcelDna.Integration
         // Use the overload that's convenient when we don't need the ProcessId - pass IntPtr.Zero for the second parameter
         [DllImport("user32.dll")]
         private static extern uint GetWindowThreadProcessId(IntPtr hWnd, /*out uint */ IntPtr refProcessId);
+        [DllImport("user32.dll")]
+        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+        [DllImport("ole32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+        private static extern int CLSIDFromProgID(string lpszProgID, out Guid clsid);
+        [DllImport("oleaut32.dll", PreserveSig = false)]
+        private static extern void GetActiveObject(ref Guid rclsid, IntPtr pvReserved, [MarshalAs(UnmanagedType.Interface)] out object ppunk);
         [DllImport("Kernel32")]
         private static extern uint GetCurrentThreadId();
 
@@ -216,6 +222,7 @@ namespace ExcelDna.Integration
         // CONSIDER: ThreadStatic not needed anymore - only cached and used on main thread anyway.
         // [ThreadStatic] 
         static Microsoft.Office.Interop.Excel.Application _application;
+        static int _etBootstrapFailed;
         static readonly CultureInfo _enUsCulture = new CultureInfo(1033);
         public static object Application
         {
@@ -284,14 +291,35 @@ namespace ExcelDna.Integration
 
         private static Microsoft.Office.Interop.Excel.Application GetApplication(bool allowProtected, out bool isProtected)
         {
-            // Don't cache the one we get from the Window, it keeps Excel alive! 
-            // (?? Really ?? - Probably only when we're not on the main thread...)
-            Microsoft.Office.Interop.Excel.Application application = GetApplicationFromWindows(allowProtected, out isProtected);
-            if (application != null) return application;
+            if (IsET)
+            {
+                Microsoft.Office.Interop.Excel.Application applicationFromRot = GetApplicationFromRot();
+                if (applicationFromRot != null)
+                {
+                    isProtected = false;
+                    return applicationFromRot;
+                }
 
-            // DOCUMENT: Under some circumstances, the C API and Automation interfaces are not available.
-            //  This happens when there is no Workbook open in Excel.
-            // Now make workbook with VBA sheet, according to some Google post.
+                Microsoft.Office.Interop.Excel.Application applicationFromWindows = GetApplicationFromWindows(allowProtected, out isProtected);
+                if (applicationFromWindows != null)
+                {
+                    return applicationFromWindows;
+                }
+
+                if (!AllowWpsNewWorkbookBootstrap())
+                {
+                    isProtected = false;
+                    return null;
+                }
+            }
+            else
+            {
+                Microsoft.Office.Interop.Excel.Application applicationFromWindows = GetApplicationFromWindows(allowProtected, out isProtected);
+                if (applicationFromWindows != null)
+                {
+                    return applicationFromWindows;
+                }
+            }
 
             // We try a (possible) test for whether we can call the C API.
             if (!IsExcelApiAvailable())
@@ -304,6 +332,12 @@ namespace ExcelDna.Integration
 
         private static Microsoft.Office.Interop.Excel.Application GetApplicationFromNewWorkbook(bool allowProtected, out bool isProtected)
         {
+            if (IsET && Interlocked.CompareExchange(ref _etBootstrapFailed, 0, 0) == 1)
+            {
+                isProtected = false;
+                return null;
+            }
+
             // Create new workbook with the right stuff
             // Echo calls removed for Excel 2013 - this caused trouble in the Excel 2013 'browse' scenario.
             Microsoft.Office.Interop.Excel.Application application;
@@ -317,7 +351,29 @@ namespace ExcelDna.Integration
                 // Try again
                 application = GetApplicationFromWindows(allowProtected, out isProtected);
 
-                XlCall.Excel(XlCall.xlcFileClose, false);
+                if (IsET)
+                {
+                    if (application == null)
+                    {
+                        Interlocked.Exchange(ref _etBootstrapFailed, 1);
+                        try
+                        {
+                            XlCall.Excel(XlCall.xlcFileClose, false);
+                        }
+                        catch
+                        {
+                            // Ignore and continue
+                        }
+                    }
+                    else
+                    {
+                        ScheduleCloseEtBootstrapWorkbook(application);
+                    }
+                }
+                else
+                {
+                    XlCall.Excel(XlCall.xlcFileClose, false);
+                }
             }
             catch
             {
@@ -333,8 +389,94 @@ namespace ExcelDna.Integration
             return application; // Might be null in a bad case, but we have no further ideas
         }
 
-        // internal implementation that does not throw in the case where the C API is unavailable,
-        // to improve QueueAsMacro reliability
+        internal static Microsoft.Office.Interop.Excel.Application GetApplicationNoWorkbook(bool allowProtected, out bool isProtected)
+        {
+            if (IsET)
+            {
+                Microsoft.Office.Interop.Excel.Application applicationFromRot = GetApplicationFromRot();
+                if (applicationFromRot != null)
+                {
+                    isProtected = false;
+                    return applicationFromRot;
+                }
+            }
+
+            return GetApplicationFromWindows(allowProtected, out isProtected);
+        }
+
+        private static void ScheduleCloseEtBootstrapWorkbook(Microsoft.Office.Interop.Excel.Application application)
+        {
+            if (application == null)
+                return;
+
+            try
+            {
+                Type appType = application.GetType();
+                object workbooks = appType.InvokeMember("Workbooks", BindingFlags.GetProperty, null, application, null, _enUsCulture);
+                if (workbooks == null)
+                    return;
+                Type workbooksType = workbooks.GetType();
+                object countObj = workbooksType.InvokeMember("Count", BindingFlags.GetProperty, null, workbooks, null, _enUsCulture);
+                int count = Convert.ToInt32(countObj, CultureInfo.InvariantCulture);
+                if (count != 1)
+                    return;
+
+                object activeWorkbook = appType.InvokeMember("ActiveWorkbook", BindingFlags.GetProperty, null, application, null, _enUsCulture);
+                if (activeWorkbook == null)
+                    return;
+
+                Type workbookType = activeWorkbook.GetType();
+                string name = workbookType.InvokeMember("Name", BindingFlags.GetProperty, null, activeWorkbook, null, _enUsCulture) as string;
+                string path = workbookType.InvokeMember("Path", BindingFlags.GetProperty, null, activeWorkbook, null, _enUsCulture) as string;
+                if (!string.IsNullOrEmpty(path))
+                    return;
+
+                ExcelAsyncUtil.QueueAsMacro(() => TryCloseEtBootstrapWorkbook(application, name));
+            }
+            catch
+            {
+                // Ignore and continue
+            }
+        }
+
+        private static void TryCloseEtBootstrapWorkbook(Microsoft.Office.Interop.Excel.Application application, string expectedName)
+        {
+            if (application == null)
+                return;
+
+            try
+            {
+                Type appType = application.GetType();
+                object workbooks = appType.InvokeMember("Workbooks", BindingFlags.GetProperty, null, application, null, _enUsCulture);
+                if (workbooks == null)
+                    return;
+                Type workbooksType = workbooks.GetType();
+                object countObj = workbooksType.InvokeMember("Count", BindingFlags.GetProperty, null, workbooks, null, _enUsCulture);
+                int count = Convert.ToInt32(countObj, CultureInfo.InvariantCulture);
+                if (count != 1)
+                    return;
+
+                object activeWorkbook = appType.InvokeMember("ActiveWorkbook", BindingFlags.GetProperty, null, application, null, _enUsCulture);
+                if (activeWorkbook == null)
+                    return;
+
+                Type workbookType = activeWorkbook.GetType();
+                string name = workbookType.InvokeMember("Name", BindingFlags.GetProperty, null, activeWorkbook, null, _enUsCulture) as string;
+                if (!string.Equals(name, expectedName, StringComparison.Ordinal))
+                    return;
+
+                string path = workbookType.InvokeMember("Path", BindingFlags.GetProperty, null, activeWorkbook, null, _enUsCulture) as string;
+                if (!string.IsNullOrEmpty(path))
+                    return;
+
+                workbookType.InvokeMember("Close", BindingFlags.InvokeMethod, null, activeWorkbook, new object[] { false }, _enUsCulture);
+            }
+            catch
+            {
+                // Ignore and continue
+            }
+        }
+
         internal static object GetApplicationNotProtectedNoThrow()
         {
             if (!IsMainThread)
@@ -349,6 +491,16 @@ namespace ExcelDna.Integration
                 return _application;
             }
 
+            if (IsET)
+            {
+                Microsoft.Office.Interop.Excel.Application applicationFromRot = GetApplicationFromRot();
+                if (applicationFromRot != null)
+                {
+                    _application = applicationFromRot;
+                    return applicationFromRot;
+                }
+            }
+
             bool isProtected;
             var application = GetApplicationFromWindows(false, out isProtected);
             if (application != null && !isProtected)
@@ -356,6 +508,11 @@ namespace ExcelDna.Integration
                 // Only cache and use if not a protected application
                 _application = application;
                 return application;
+            }
+
+            if (IsET && !AllowWpsNewWorkbookBootstrap())
+            {
+                return null;
             }
 
             // We try a (possible) test for whether we can call the C API.
@@ -379,12 +536,12 @@ namespace ExcelDna.Integration
 
         static Microsoft.Office.Interop.Excel.Application GetApplicationFromWindows(bool allowProtected, out bool isProtected)
         {
-            if (SafeIsExcelVersionPre15)
+            if (IsET || !SafeIsExcelVersionPre15)
             {
-                return GetApplicationFromWindow(WindowHandle, allowProtected, out isProtected);
+                return GetApplicationFromWindows15(allowProtected, out isProtected);
             }
 
-            return GetApplicationFromWindows15(allowProtected, out isProtected);
+            return GetApplicationFromWindow(WindowHandle, allowProtected, out isProtected);
         }
 
         // Enumerate through all top-level windows of the main thread,
@@ -397,20 +554,81 @@ namespace ExcelDna.Integration
 
             EnumThreadWindows(_mainNativeThreadId, delegate (IntPtr hWndEnum, IntPtr param)
             {
-                // Check the window class
-                if (IsAnExcelWindow(hWndEnum, buffer))
+                if (IsET)
                 {
                     application = GetApplicationFromWindow(hWndEnum, allowProtected, out localIsProtected);
-                    if (application != null)
-                    {
-                        return false;	// Stop enumerating
-                    }
-                    return true;
+                    return !(application != null | localIsProtected);
                 }
-                return true;	// Continue enumerating
+
+                // Check the window class
+                if (!IsAnExcelWindow(hWndEnum, buffer))
+                    return true;
+
+                application = GetApplicationFromWindow(hWndEnum, allowProtected, out localIsProtected);
+                return application == null;
             }, IntPtr.Zero);
             isProtected = localIsProtected;
+
             return application; // May or may not be null
+        }
+
+        private static Microsoft.Office.Interop.Excel.Application GetApplicationFromRot()
+        {
+            string[] progIds = new[] { "ET.Application", "KET.Application" };
+            foreach (string progId in progIds)
+            {
+                try
+                {
+                    Microsoft.Office.Interop.Excel.Application app = TryCastToExcelApplication(TryGetActiveObjectFromProgId(progId));
+                    if (app != null)
+                        return app;
+                }
+                catch (COMException)
+                {
+                    // Ignore and continue
+                }
+                catch
+                {
+                    // Ignore and continue
+                }
+            }
+            return null;
+        }
+
+        private static Microsoft.Office.Interop.Excel.Application TryCastToExcelApplication(object appObj)
+        {
+            if (appObj == null)
+                return null;
+            if (appObj is Microsoft.Office.Interop.Excel.Application directApp)
+                return directApp;
+            try
+            {
+                return (Microsoft.Office.Interop.Excel.Application)Marshal.CreateWrapperOfType(appObj, typeof(Microsoft.Office.Interop.Excel.Application));
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static object TryGetActiveObjectFromProgId(string progId)
+        {
+            try
+            {
+                Guid clsid;
+                if (CLSIDFromProgID(progId, out clsid) != 0)
+                {
+                    return null;
+                }
+
+                object obj;
+                GetActiveObject(ref clsid, IntPtr.Zero, out obj);
+                return obj;
+            }
+            catch
+            {
+                return null;
+            }
         }
 
         private static Microsoft.Office.Interop.Excel.Application GetApplicationFromWindow(IntPtr hWndMain, bool allowProtected, out bool isProtected)
@@ -421,77 +639,123 @@ namespace ExcelDna.Integration
             StringBuilder cname = new StringBuilder(256);
             bool localIsProtected = false;
 
+            if (IsET && IsWpsWindowClass(hWndMain, cname))
+            {
+                app = TryGetApplicationFromAccessibleObject(hWndMain, allowProtected, ref localIsProtected);
+                if (app != null || localIsProtected)
+                {
+                    isProtected = localIsProtected;
+                    return app;
+                }
+            }
+
             EnumChildWindows(hWndMain, delegate (IntPtr hWndEnum, IntPtr param)
             {
-                // Check the window class
                 GetClassNameW(hWndEnum, cname, cname.Capacity);
-                if (cname.ToString() != "EXCEL7")
-                    // Not a workbook window, continue enumerating
-                    return true;
-
-                IntPtr pUnk = IntPtr.Zero;
-                int hr = AccessibleObjectFromWindow(hWndEnum, OBJID_NATIVEOM, IID_IDispatchBytes, ref pUnk);
-                if (hr != 0)
+                if (IsET)
                 {
-                    // Window does not implement the IID, continue enumerating
+                    if (!IsWpsWindowClassName(cname.ToString()))
+                        return true;
+                }
+                else if (cname.ToString() != "EXCEL7")
+                {
                     return true;
                 }
 
-                // Marshal to .NET, then call .Application
-                object obj = Marshal.GetObjectForIUnknown(pUnk);
-                Marshal.Release(pUnk);
-
-                try
-                {
-                    if (ComInterop.DispatchHelper.HasProperty(obj, "Application"))
-                    {
-                        app = (Microsoft.Office.Interop.Excel.Application)obj.GetType().InvokeMember("Application", BindingFlags.GetProperty, null, obj, null, _enUsCulture);
-                    }
-                    else
-                    {
-                        // In some cases - always when Excel only a workbook open in Protected Mode when this code runs - 
-                        // we get a ProtectedViewWindow, which has no Application property, but then we can do .Workbook.Application
-                        if (allowProtected)
-                        {
-                            try
-                            {
-                                object workbook = obj.GetType().InvokeMember("Workbook", BindingFlags.GetProperty, null, obj, null, _enUsCulture);
-                                app = (Microsoft.Office.Interop.Excel.Application)workbook.GetType().InvokeMember("Application", BindingFlags.GetProperty, null, workbook, null, _enUsCulture);
-
-                                // WARNING: The Application object returning from here can be problematic:
-                                //          * It is a "sandbox" view of the Application that cannot Run macros or change workbooks
-                                //          * It will die after the protected view closes
-                                //          We return it, but should not cache it
-                                localIsProtected = true;
-                            }
-                            catch
-                            {
-                                // Otherwise we fail - this way the higher-level call will open up a regular workbook and try again
-                                Debug.Fail("Unexpected exception when getting Application");
-                            }
-                        }
-                        else
-                        {
-                            // We don't want to continue enumeration in this case - another window might give us an Application, but it will be a protected one anyway
-                            localIsProtected = true;
-                        }
-                    }
-                }
-                catch
-                {
-                    // Otherwise we fail - this way the higher-level call will open up a regular workbook and try again
-                    Debug.Fail("Unexpected exception when getting Application");
-                }
-                finally
-                {
-                    Marshal.ReleaseComObject(obj);
-                }
+                app = TryGetApplicationFromAccessibleObject(hWndEnum, allowProtected, ref localIsProtected);
 
                 // Continue enumeration? Only if the app is not yet found and protected flag not set.
                 return (app == null) && !localIsProtected;
             }, IntPtr.Zero);
             isProtected = localIsProtected;
             return app;
+        }
+
+        private static Microsoft.Office.Interop.Excel.Application TryGetApplicationFromAccessibleObject(IntPtr hWnd, bool allowProtected, ref bool localIsProtected)
+        {
+            IntPtr pUnk = IntPtr.Zero;
+            int hr = AccessibleObjectFromWindow(hWnd, OBJID_NATIVEOM, IID_IDispatchBytes, ref pUnk);
+            if (hr != 0)
+            {
+                return null;
+            }
+
+            object obj = null;
+            try
+            {
+                obj = Marshal.GetObjectForIUnknown(pUnk);
+            }
+            catch
+            {
+                return null;
+            }
+            finally
+            {
+                if (pUnk != IntPtr.Zero)
+                {
+                    Marshal.Release(pUnk);
+                }
+            }
+
+            try
+            {
+                if (ComInterop.DispatchHelper.HasProperty(obj, "Application"))
+                {
+                    object appObj = obj.GetType().InvokeMember("Application", BindingFlags.GetProperty, null, obj, null, _enUsCulture);
+                    return TryCastToExcelApplication(appObj);
+                }
+
+                if (allowProtected && ComInterop.DispatchHelper.HasProperty(obj, "Workbook"))
+                {
+                    try
+                    {
+                        object workbook = obj.GetType().InvokeMember("Workbook", BindingFlags.GetProperty, null, obj, null, _enUsCulture);
+                        object appObj = workbook.GetType().InvokeMember("Application", BindingFlags.GetProperty, null, workbook, null, _enUsCulture);
+                        var app = TryCastToExcelApplication(appObj);
+                        if (app != null)
+                        {
+                            localIsProtected = true;
+                            return app;
+                        }
+                    }
+                    catch
+                    {
+                        Debug.Fail("Unexpected exception when getting Application");
+                    }
+                }
+                else if (!allowProtected)
+                {
+                    localIsProtected = true;
+                }
+            }
+            catch
+            {
+                Debug.Fail("Unexpected exception when getting Application");
+            }
+            finally
+            {
+                if (obj != null)
+                {
+                    Marshal.ReleaseComObject(obj);
+                }
+            }
+
+            return null;
+        }
+
+        private static bool AllowWpsNewWorkbookBootstrap()
+        {
+            try
+            {
+                string value = Environment.GetEnvironmentVariable("EXCELDNA_WPS_ALLOW_XLCNEW");
+                if (string.IsNullOrEmpty(value))
+                    return false;
+                return value == "1" || value.Equals("true", StringComparison.OrdinalIgnoreCase);
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         // Returns true if the cached _application reference is valid.
@@ -595,6 +859,8 @@ namespace ExcelDna.Integration
         #region Version Helpers
         // This version is used internally - it seems a bit safer than the API calls.
         private static FileVersionInfo _excelExecutableInfo = null;
+        private static bool? _isEt;
+        private static int _isEtLogged;
         internal static FileVersionInfo ExcelExecutableInfo
         {
             get
@@ -607,6 +873,75 @@ namespace ExcelDna.Integration
                 return _excelExecutableInfo;
             }
         }
+        // Detect WPS Spreadsheets (ET) host.
+        public static bool IsET
+        {
+            get
+            {
+                if (!_isEt.HasValue)
+                {
+                    bool isEt = false;
+                    string exeName = string.Empty;
+                    string productName = string.Empty;
+                    string companyName = string.Empty;
+                    try
+                    {
+                        var info = ExcelExecutableInfo;
+                        if (info != null)
+                        {
+                            productName = info.ProductName ?? string.Empty;
+                            companyName = info.CompanyName ?? string.Empty;
+                            string fileName = info.FileName;
+                            if (!string.IsNullOrEmpty(fileName))
+                                exeName = Path.GetFileNameWithoutExtension(fileName) ?? string.Empty;
+                        }
+
+                        isEt = string.Equals(exeName, "et", StringComparison.OrdinalIgnoreCase);
+                        if (!isEt && IsWpsHost(exeName, productName, companyName))
+                            isEt = true;
+                    }
+                    catch
+                    {
+                        isEt = false;
+                    }
+
+                    _isEt = isEt;
+                    if (Interlocked.Exchange(ref _isEtLogged, 1) == 0)
+                    {
+                        ExcelDna.Logging.Logger.Initialization.Info(
+                            "Host detection: exeName={0}, product={1}, company={2}, IsET={3}",
+                            exeName, productName, companyName, isEt);
+                    }
+                }
+                return _isEt.Value;
+            }
+        }
+
+        static bool IsWpsHost(string exeName, string productName, string companyName)
+        {
+            if (!string.IsNullOrEmpty(exeName) &&
+                exeName.IndexOf("wps", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return true;
+            }
+
+            if (!string.IsNullOrEmpty(productName) &&
+                (productName.IndexOf("wps", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                 productName.IndexOf("kingsoft", StringComparison.OrdinalIgnoreCase) >= 0))
+            {
+                return true;
+            }
+
+            if (!string.IsNullOrEmpty(companyName) &&
+                (companyName.IndexOf("wps", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                 companyName.IndexOf("kingsoft", StringComparison.OrdinalIgnoreCase) >= 0))
+            {
+                return true;
+            }
+
+            return false;
+        }
+
 
         // One of our many, many version helpers...
         // This is safer than ExcelVersion since we can call it from initialization 
@@ -683,7 +1018,53 @@ namespace ExcelDna.Integration
         {
             buffer.Length = 0;
             GetClassNameW(hWnd, buffer, buffer.Capacity);
-            return buffer.ToString() == "XLMAIN";
+            string className = buffer.ToString();
+            if (className == "XLMAIN")
+                return true;
+
+            if (IsET && IsWpsMainWindowClass(className))
+                return true;
+
+            return false;
+        }
+
+        static bool IsWpsMainWindowClass(string className)
+        {
+            if (string.IsNullOrEmpty(className))
+                return false;
+
+            if (className.StartsWith("ET", StringComparison.OrdinalIgnoreCase))
+                return true;
+            if (className.StartsWith("WPS", StringComparison.OrdinalIgnoreCase))
+                return true;
+            if (className.Equals("OpusApp", StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            return false;
+        }
+
+        static bool IsWpsWindowClass(IntPtr hWnd, StringBuilder buffer)
+        {
+            buffer.Length = 0;
+            GetClassNameW(hWnd, buffer, buffer.Capacity);
+            return IsWpsWindowClassName(buffer.ToString());
+        }
+
+        static bool IsWpsWindowClassName(string className)
+        {
+            if (string.IsNullOrEmpty(className))
+                return false;
+
+            if (IsWpsMainWindowClass(className))
+                return true;
+            if (className.StartsWith("QWidget", StringComparison.OrdinalIgnoreCase))
+                return true;
+            if (className.StartsWith("QEventDispatcherWin32_Internal_Widget", StringComparison.OrdinalIgnoreCase))
+                return true;
+            if (className.StartsWith("KAccountWnd_Kso_classname", StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            return false;
         }
 
         // Try to find an Excel window with window handle that matches the passed lo word.
@@ -758,8 +1139,7 @@ namespace ExcelDna.Integration
                 {
                     object result;
                     var returnValue = XlCall.TryExcel(614, out result, new object[] { 1 }, new object[] { true }); // 614 means FILTER
-                    // Now examine returnValue, which should be of type XlReturn – it will presumably be XlReturn.XlReturnSuccess for Dynamic Array Excel, otherwise XlReturn.XlReturnFailed or similar for non-DA Excel.
-                    _supportsDynamicArrays = (returnValue == XlCall.XlReturn.XlReturnSuccess);
+                    // Now examine returnValue, which should be of type XlReturn ?it will presumably be XlReturn.XlReturnSuccess for Dynamic Array Excel, otherwise XlReturn.XlReturnFailed or similar for non-DA Excel.                    _supportsDynamicArrays = (returnValue == XlCall.XlReturn.XlReturnSuccess);
                 }
                 return _supportsDynamicArrays.Value;
             }

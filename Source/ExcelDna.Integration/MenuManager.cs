@@ -22,7 +22,7 @@ namespace ExcelDna.Integration
         static IMenuManager _menuManager;
         static MenuManager()
         {
-            if (ExcelDnaUtil.SafeIsExcelVersionPre15)
+            if (ExcelDnaUtil.SafeIsExcelVersionPre15 && !ExcelDnaUtil.IsET)
             {
                 _menuManager = new ExcelPre15MenuManager();
             }
@@ -219,7 +219,7 @@ namespace ExcelDna.Integration
             }
             catch (Exception e)
             {
-                Logger.Initialization.Error(e, "MenuManager.AddCommandMenu Error");
+                Logger.Initialization.Error(e, "MenuManager.AddCommandMenu Error. Maybe you are running in debug mode of vs in WPS.");
             }
         }
 

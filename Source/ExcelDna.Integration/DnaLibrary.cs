@@ -385,7 +385,10 @@ namespace ExcelDna.Integration
                 }
             }
             // This is safe, even if never registered
-            SynchronizationManager.Uninstall();
+            if (!ExcelDnaUtil.IsET)
+            {
+                SynchronizationManager.Uninstall();
+            }
             RegistrationInfo.Unregister();
             _addIns.Clear();
         }
@@ -401,6 +404,12 @@ namespace ExcelDna.Integration
                 {
                     // Load ExcelRibbon classes
                     ExcelRibbon excelRibbon = addIn.Instance as ExcelRibbon;
+                    if (excelRibbon == null)
+                    {
+                        Logger.Initialization.Error("Failed to load Ribbon add-in for {0}. Ensure the add-in loads ExcelDna.Integration from the XLL (LoadFromBytes=\"true\").",
+                            addIn.ParentDnaLibrary != null ? addIn.ParentDnaLibrary.Name : "<unknown>");
+                        continue;
+                    }
                     excelRibbon.DnaLibrary = addIn.ParentDnaLibrary;
                     ExcelComAddInHelper.LoadComAddIn(excelRibbon);
                     uiLoaded = true;
