@@ -43,6 +43,11 @@ namespace ExcelDna.Integration
             _progId = progId;
         }
 
+        internal string GetProgId()
+        {
+            return _progId;
+        }
+
         public string FriendlyName { get; protected set; }
         public string Description { get; protected set; }
 
@@ -122,6 +127,19 @@ namespace ExcelDna.Integration
         public static void OnUnloadComAddIn(ExcelComAddIn addIn, object addInInst)
         {
             loadedComAddIns.Remove(addInInst);
+
+            // Clear the "already loaded" marker so the add-in can be loaded again in this process.
+            // Without this, a Ribbon that is unloaded and then needs to be reloaded (e.g. after the
+            // user re-enables the add-in) would be skipped forever by IsWpsComAddInLoaded.
+            string progId = addIn != null ? addIn.GetProgId() : null;
+            if (!string.IsNullOrEmpty(progId))
+            {
+                lock (_wpsRetryLock)
+                {
+                    _wpsRetryCounts.Remove(progId);
+                }
+                Logger.ComAddIn.Verbose("WPS: cleared COM Add-In retry state for {0}", progId);
+            }
         }
 
         public static void LoadComAddIn(ExcelComAddIn addIn)
@@ -311,6 +329,13 @@ namespace ExcelDna.Integration
                 comAddIn.GetType().InvokeMember("Connect", System.Reflection.BindingFlags.SetProperty, null, comAddIn, new object[] { false }, ci);
                 Logger.ComAddIn.Info("Ribbon/COM Add-In Unloaded.");
             }
+
+            // Drop all retry/"already loaded" markers. This path does not go through OnUnloadComAddIn,
+            // so without this the state would leak and block any later reload of the Ribbon.
+            lock (_wpsRetryLock)
+            {
+                _wpsRetryCounts.Clear();
+            }
         }
 
         private static bool IsWpsHost()
@@ -318,16 +343,22 @@ namespace ExcelDna.Integration
             try
             {
                 var fileName = Process.GetCurrentProcess().MainModule?.FileName;
-                if (string.IsNullOrEmpty(fileName))
-                    return false;
-
-                var processName = Path.GetFileNameWithoutExtension(fileName);
-                return string.Equals(processName, "et", StringComparison.OrdinalIgnoreCase);
+                if (!string.IsNullOrEmpty(fileName))
+                {
+                    var processName = Path.GetFileNameWithoutExtension(fileName);
+                    if (string.Equals(processName, "et", StringComparison.OrdinalIgnoreCase))
+                        return true;
+                }
             }
             catch
             {
-                return false;
+                // Fall through to the shared host detection below.
             }
+
+            // Keep this consistent with ExcelDnaUtil.IsET, which also inspects the executable's
+            // ProductName/CompanyName (some WPS builds do not ship an exe literally named et.exe).
+            // Diverging here caused WPS hosts to take the non-WPS code paths in the COM Add-In load.
+            return ExcelDnaUtil.IsET;
         }
 
         private static object GetApplicationForComAddIn(bool isWpsHost)
@@ -451,10 +482,29 @@ namespace ExcelDna.Integration
                 }
             }
 
+            // The retry needs QueueAsMacro, which requires SynchronizationManager. Rather than
+            // silently dropping the retry (which made WPS Ribbon failures undiagnosable), try to
+            // install it when we are on the main thread, and otherwise report loudly.
             if (!SynchronizationManager.IsInstalled)
             {
-                Logger.ComAddIn.Info("WPS: SynchronizationManager not installed; retry skipped for {0}", progId);
-                return;
+                if (ExcelDnaUtil.IsMainThread)
+                {
+                    try
+                    {
+                        SynchronizationManager.Install(true);
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.ComAddIn.Warn("WPS: SynchronizationManager.Install failed while preparing COM Add-In retry for {0}. {1}", progId, ex);
+                    }
+                }
+
+                if (!SynchronizationManager.IsInstalled)
+                {
+                    Logger.ComAddIn.Warn("WPS: SynchronizationManager not installed; COM Add-In retry for {0} cannot be scheduled. The Ribbon will NOT load. " +
+                        "Check that the SynchronizationMacro can be registered (xlfRegister) in this WPS build.", progId);
+                    return;
+                }
             }
 
             Logger.ComAddIn.Info("WPS: scheduling COM Add-In retry {0}/{1} for {2}", attempt, WpsComAddInRetryMax, progId);

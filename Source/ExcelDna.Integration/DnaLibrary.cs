@@ -406,8 +406,14 @@ namespace ExcelDna.Integration
                     ExcelRibbon excelRibbon = addIn.Instance as ExcelRibbon;
                     if (excelRibbon == null)
                     {
-                        Logger.Initialization.Error("Failed to load Ribbon add-in for {0}. Ensure the add-in loads ExcelDna.Integration from the XLL (LoadFromBytes=\"true\").",
-                            addIn.ParentDnaLibrary != null ? addIn.ParentDnaLibrary.Name : "<unknown>");
+                        // Report both types: when the add-in assembly and the XLL hold different copies
+                        // of ExcelDna.Integration, the cast fails silently and the Ribbon never loads.
+                        // The assembly qualified names make that mismatch obvious.
+                        string instanceType = addIn.Instance != null ? addIn.Instance.GetType().AssemblyQualifiedName : "<null instance>";
+                        Logger.Initialization.Error("Failed to load Ribbon add-in for {0}. Ensure the add-in loads ExcelDna.Integration from the XLL (LoadFromBytes=\"true\"). Instance type: {1}. Expected base type: {2}",
+                            addIn.ParentDnaLibrary != null ? addIn.ParentDnaLibrary.Name : "<unknown>",
+                            instanceType,
+                            typeof(ExcelRibbon).AssemblyQualifiedName);
                         continue;
                     }
                     excelRibbon.DnaLibrary = addIn.ParentDnaLibrary;
